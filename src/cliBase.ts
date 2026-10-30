@@ -1,29 +1,53 @@
-import { Cli } from "incur";
+import { Cli, z } from "incur";
 
-import { npxRegistrationCommand } from "./application/ClientRegistrationIdentity.js";
-import { projectAnalysisError } from "./domain/analysisErrorProjection.js";
+import { currentClientRegistrationCommand } from "./application/ClientRegistrationIdentity.js";
+import { clientRegistrationCommandText } from "./cli/clientRegistrationCommandText.js";
 import { PRODUCT_IDENTITY } from "./identity.js";
-import { parseLogLevel } from "./logger.js";
-
-/** Describe CLI settings that are invalid before any command runs, as MCP does. */
-export const cliConfigurationError = (
-  selectedEnvironment: Readonly<Record<string, string | undefined>>,
-): string | undefined => {
-  const value = selectedEnvironment.REA_LOG_LEVEL;
-  if (value === undefined) return undefined;
-  const level = parseLogLevel(value);
-  return level.ok ? undefined : projectAnalysisError(level.error).message;
-};
 
 /** Shared CLI identity and builtins, without command-specific schemas. */
-export const createCliBase = () =>
-  Cli.create(PRODUCT_IDENTITY.cliBinary, {
+export const createCliBase = (
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+) => {
+  const cli = Cli.create(PRODUCT_IDENTITY.cliBinary, {
     version: PRODUCT_IDENTITY.packageVersion,
     description: "Reverse engineer anything from your terminal or agent.",
+    globals: z.object({
+      timings: z
+        .boolean()
+        .default(false)
+        .describe("Write measured command timing to stderr."),
+    }),
     mcp: {
-      command: npxRegistrationCommand().join(" "),
+      command: clientRegistrationCommandText(
+        currentClientRegistrationCommand({ environment }),
+      ),
       instructions:
         "Ask what software, artifact, protocol, or behavior the user wants to understand, then choose the available investigation capabilities that can produce evidence.",
     },
     sync: false,
+    update: {
+      // Incur's update:false only suppresses notices. Reject its explicit
+      // installer so ambiguous flags cannot bypass REA's verified workflow.
+      install: () => {
+        throw new Error(
+          "Use 'rea update' to update the identified installation. The '--update' alias accepts only global output flags.",
+        );
+      },
+    },
   });
+
+  cli.use(async (context, next) => {
+    if (!context.globals.timings) return next();
+    const started = performance.now();
+    try {
+      await next();
+    } finally {
+      // This interval covers CLI command dispatch, including result delivery.
+      // It is not a provider-only or analysis-only measurement.
+      process.stderr.write(
+        `${JSON.stringify({ rea_timings: { version: 1, command_ms: Math.round(performance.now() - started) } })}\n`,
+      );
+    }
+  });
+  return cli;
+};

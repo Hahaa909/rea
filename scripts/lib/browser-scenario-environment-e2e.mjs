@@ -11,7 +11,7 @@ import { browserScenarioSchema } from "../../dist/domain/browserScenario.js";
 import { AnalysisCancelledError } from "../../dist/domain/analysisErrorCore.js";
 import { runScenarioCli } from "./browser-scenario-verifier.mjs";
 import { requireMcpEvidenceResult } from "./mcp-verifier-results.mjs";
-import { closeVerifierResources } from "./verifier-cleanup.mjs";
+import { withVerifierCleanup } from "./verifier-cleanup.mjs";
 
 const expected = {
   timezone: "Pacific/Honolulu",
@@ -97,8 +97,32 @@ const assertCapture = (capture, values = expected) => {
   }
 };
 
+const assertCallerLanguage = (capture, baseline) => {
+  assert.ok(
+    capture.limitations.some((value) =>
+      value.includes("Attached locale fr-FR applies to Intl formatting only"),
+    ),
+    "Attached capture must identify its page/request language limitation",
+  );
+  for (const step of capture.steps) {
+    const text = step.artifacts.dom.value.text;
+    const observed = /<pre id="language">([^<]+)<\/pre>/u.exec(text);
+    assert.ok(
+      observed,
+      "DOM omitted the navigator/request language observations",
+    );
+    assert.deepEqual(JSON.parse(observed[1]), baseline);
+  }
+};
+
 /** Verify actual attached-page emulation and restoration across scenario outcomes. */
 export async function verifyScenarioEnvironment(endpoint, targetId, origin) {
+  const languageExpression = `(async () => JSON.stringify({
+    language: navigator.language, languages: [...navigator.languages],
+    request_language: await (await fetch(
+      ${JSON.stringify(`${origin}/scenario-request-language`)}, { cache: "no-store" }
+    )).json()
+  }))()`;
   const targets = await (await fetch(`${endpoint}/json/list`)).json();
   const target = targets.find(({ id }) => id === targetId);
   assert.ok(target, "External fixture target is missing");
@@ -106,18 +130,64 @@ export async function verifyScenarioEnvironment(endpoint, targetId, origin) {
     target.webSocketDebuggerUrl,
     "capture_browser_scenario",
   );
-  const readEnvironment = async () => {
+  const readEnvironment = async (expressionToRead = expression) => {
     const value = await connection.send("Runtime.evaluate", {
-      expression,
+      expression: expressionToRead,
       returnByValue: true,
+      awaitPromise: true,
     });
     assert.equal(value.result.type, "string");
     return JSON.parse(value.result.value);
   };
   const provider = createBrowserScenarioProvider(process.env);
-  let verificationError;
-  try {
+  let unselected;
+  let unselectedTarget;
+  return withVerifierCleanup(async () => {
+    // The fixture owns this extra page. A scenario selecting targetId must not
+    // initialize Playwright defaults on another caller-owned page.
+    const created = await connection.send("Target.createTarget", {
+      url: "about:blank",
+    });
+    unselectedTarget = created.targetId;
+    const pages = await (await fetch(`${endpoint}/json/list`)).json();
+    const other = pages.find(({ id }) => id === unselectedTarget);
+    assert.ok(other, "Owned unselected fixture page is missing");
+    unselected = await CdpConnection.connect(
+      other.webSocketDebuggerUrl,
+      "capture_browser_scenario",
+    );
+    const pageIds = pages
+      .filter(({ type }) => type === "page")
+      .map(({ id }) => id)
+      .sort();
+    await unselected.send("Emulation.setEmulatedMedia", {
+      features: [{ name: "prefers-color-scheme", value: "dark" }],
+    });
+    const assertUnselectedState = async () => {
+      const observed = await unselected.send("Runtime.evaluate", {
+        expression: "matchMedia('(prefers-color-scheme: dark)').matches",
+        returnByValue: true,
+      });
+      assert.equal(
+        observed.result.value,
+        true,
+        "Scenario attachment changed media on an unselected page",
+      );
+    };
+    await assertUnselectedState();
+    // Settle the selected tab's actual layout before taking the restoration
+    // baseline, then leave it in the background for the scenario's actions.
+    await connection.send("Target.activateTarget", { targetId });
+    await connection.send("Runtime.evaluate", {
+      expression:
+        "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+      awaitPromise: true,
+    });
     const baseline = await readEnvironment();
+    const callerLanguage = await readEnvironment(languageExpression);
+    await connection.send("Target.activateTarget", {
+      targetId: unselectedTarget,
+    });
     const scenario = environmentScenario({
       endpoint,
       targetId,
@@ -126,10 +196,24 @@ export async function verifyScenarioEnvironment(endpoint, targetId, origin) {
     });
     const assertRestored = async () => {
       assert.deepEqual(await readEnvironment(), baseline);
+      assert.deepEqual(
+        await readEnvironment(languageExpression),
+        callerLanguage,
+      );
       const remaining = await (await fetch(`${endpoint}/json/list`)).json();
       assert.ok(remaining.some(({ id }) => id === targetId));
+      assert.deepEqual(
+        remaining
+          .filter(({ type }) => type === "page")
+          .map(({ id }) => id)
+          .sort(),
+        pageIds,
+        "Scenario attachment changed the caller's page inventory",
+      );
     };
-    assertCapture((await runScenarioCli(scenario)).normalized_result);
+    const cliCapture = (await runScenarioCli(scenario)).normalized_result;
+    assertCapture(cliCapture);
+    assertCallerLanguage(cliCapture, callerLanguage);
     await assertRestored();
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -141,21 +225,21 @@ export async function verifyScenarioEnvironment(endpoint, targetId, origin) {
       name: "browser-environment-e2e",
       version: "1",
     });
-    try {
+    await withVerifierCleanup(async () => {
       await client.connect(transport);
       const definition = (await client.listTools()).tools.find(
         ({ name }) => name === "capture_browser_scenario",
       );
       assert.ok(definition, "Scenario tool is absent from the current catalog");
-      assertCapture(
-        requireMcpEvidenceResult(
-          await client.callTool(
-            { name: "capture_browser_scenario", arguments: scenario },
-            { toolDefinition: definition },
-          ),
-          "capture_browser_scenario",
+      const mcpCapture = requireMcpEvidenceResult(
+        await client.callTool(
+          { name: "capture_browser_scenario", arguments: scenario },
+          { toolDefinition: definition },
         ),
+        "capture_browser_scenario",
       );
+      assertCapture(mcpCapture);
+      assertCallerLanguage(mcpCapture, callerLanguage);
       await verifyConcurrentMcpCapture({
         client,
         definition,
@@ -164,11 +248,9 @@ export async function verifyScenarioEnvironment(endpoint, targetId, origin) {
         targetId,
         origin,
         assertRestored,
+        assertUnselectedState,
       });
-    } finally {
-      await client.close();
-      await transport.close();
-    }
+    }, [() => client.close(), () => transport.close()]);
     await assertRestored();
     const initializationFailure = await provider.captureScenario({
       ...scenario,
@@ -201,20 +283,31 @@ export async function verifyScenarioEnvironment(endpoint, targetId, origin) {
       stdio_mcp: true,
       observed: expected,
       restored: baseline,
+      caller_language_preserved: callerLanguage,
+      attached_locale_limitation: true,
       initialization_failure_cleanup: true,
       action_failure_cleanup: true,
       cancellation_cleanup: true,
       external_target_preserved: true,
+      unselected_page_media_preserved: true,
     };
-  } catch (cause) {
-    verificationError = cause;
-    throw cause;
-  } finally {
-    await closeVerifierResources(
-      [() => provider.close(), () => connection.close()],
-      verificationError,
-    );
-  }
+  }, [
+    () => provider.close(),
+    () => unselected?.close(),
+    async () => {
+      if (unselectedTarget !== undefined)
+        assert.equal(
+          (
+            await connection.send("Target.closeTarget", {
+              targetId: unselectedTarget,
+            })
+          ).success,
+          true,
+          "Owned unselected fixture page was not released",
+        );
+    },
+    () => connection.close(),
+  ]);
 }
 
 const verifyConcurrentMcpCapture = async ({
@@ -225,6 +318,7 @@ const verifyConcurrentMcpCapture = async ({
   targetId,
   origin,
   assertRestored,
+  assertUnselectedState,
 }) => {
   const firstScenario = environmentScenario({
     endpoint,
@@ -257,6 +351,7 @@ const verifyConcurrentMcpCapture = async ({
   try {
     const first = callTool(firstScenario, firstCancellation.signal);
     await waitForEnvironment(connection, expected, "A");
+    await assertUnselectedState();
 
     const second = callTool(secondScenario, secondCancellation.signal);
     await client.ping();

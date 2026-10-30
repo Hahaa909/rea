@@ -13,7 +13,6 @@ describe("CLI and MCP runtime bundles", () => {
     async ({ processes, workspace }) => {
       await workspace.mkdir("dist/provider");
       await workspace.mkdir("dist/composition");
-      await workspace.mkdir("dist/cli");
       await workspace.mkdir("bridge");
       await workspace.mkdir("node_modules/external-probe");
       const files = {
@@ -49,6 +48,7 @@ export const lazyUrl = import.meta.url;`,
         "dist/generatedPackageMetadata.js":
           'export const generatedPackageMetadata = { version: "1.0.0" };',
         "dist/cli.js": 'export { facts, run } from "./main.js";',
+        "dist/cliBuiltinArguments.js": "export {};\n",
         "dist/cliBase.js": 'export { facts, run } from "./main.js";',
         "dist/cliOutput.js": 'export { facts } from "./provider/probe λ.js";',
         "dist/cli/cliResultOutput.js":
@@ -127,7 +127,6 @@ export const run = async () => {
       expect(await invoke("dist/cli-runtime/cli.js")).toEqual(previousRelease);
     },
   );
-
   workspaceCliTest(
     "rejects module-relative resolution and unknown import metadata during the build",
     async ({ workspace }) => {
@@ -135,6 +134,7 @@ export const run = async () => {
       await workspace.mkdir("dist/cli");
       await workspace.write("package.json", '{"type":"module"}');
       for (const path of [
+        "dist/cliBuiltinArguments.js",
         "dist/cliOutput.js",
         "dist/cliBase.js",
         "dist/cli/cliResultOutput.js",

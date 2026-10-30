@@ -16,6 +16,10 @@ const MARKER = "REA_TEST_RESOLVED ";
 // must not resolve them just to register the complete command catalog.
 const DEFERRED_IMPORTS = [
   {
+    name: "guided-workflows",
+    path: "/dist/application/GuidedWorkflowAccess.js",
+  },
+  {
     name: "direct-analysis",
     path: "/dist/application/DirectAnalysis.js",
   },
@@ -115,6 +119,18 @@ const DEFERRED_IMPORTS = [
     name: "reconstruction-obligation-ledger",
     path: "/dist/application/ReconstructionObligationLedgerService.js",
   },
+  {
+    name: "environment-source",
+    path: "/dist/application/environment/environmentSource.js",
+  },
+  {
+    name: "environment-export",
+    path: "/dist/application/environment/environmentExport.js",
+  },
+  {
+    name: "environment-server",
+    path: "/dist/server/environment/serveEnvironment.js",
+  },
 ] as const;
 // Report each resolved deferred package on stderr without changing resolution.
 const RESOLUTION_HOOK = `data:text/javascript,${encodeURIComponent(`
@@ -160,7 +176,7 @@ const evaluate = (source: string): readonly string[] => [
   source,
 ];
 
-describe("CLI startup imports", () => {
+describe("standalone CLI version startup", () => {
   it("reports the standalone version without loading command registration", async () => {
     const hook = `data:text/javascript,${encodeURIComponent(`
       import { registerHooks } from "node:module";
@@ -187,7 +203,9 @@ describe("CLI startup imports", () => {
       stderr: "",
     });
   });
+});
 
+describe("CLI startup imports", () => {
   it("preserves version output and configuration errors across both routes", async () => {
     for (const args of [["--version"], ["--version", "--json"]]) {
       const env = { ...process.env, COMPLETE: "", REA_LOG_LEVEL: "silent" };
@@ -199,10 +217,14 @@ describe("CLI startup imports", () => {
           env,
         },
       );
-      expect(result).toMatchObject({
-        stdout: `${PRODUCT_IDENTITY.packageVersion}\n`,
-        stderr: "",
-      });
+      expect(result.stderr).toBe("");
+      if (args.includes("--json"))
+        expect(JSON.parse(result.stdout)).toMatchObject({
+          name: PRODUCT_IDENTITY.packageName,
+          version: PRODUCT_IDENTITY.packageVersion,
+          runtime: { id: "node", version: process.versions.node },
+        });
+      else expect(result.stdout).toBe(`${PRODUCT_IDENTITY.packageVersion}\n`);
       await expect(
         execute(process.execPath, ["scripts/rea.mjs", ...args], {
           cwd: process.cwd(),
@@ -219,6 +241,20 @@ describe("CLI startup imports", () => {
   });
 
   it("detects each deferred package when its command code loads", async () => {
+    await expect(
+      resolvedPackages(
+        evaluate(
+          'await import("./dist/application/environment/environmentSource.js");',
+        ),
+      ),
+    ).resolves.toContain("environment-source");
+    await expect(
+      resolvedPackages(
+        evaluate(
+          'await import("./dist/application/environment/environmentExport.js");',
+        ),
+      ),
+    ).resolves.toContain("environment-export");
     const missingBrowser = join(
       await createTestTempDirectory("rea-startup-browser-"),
       "missing-browser",
@@ -249,6 +285,25 @@ describe("CLI startup imports", () => {
     await expect(
       resolvedPackages(["scripts/rea.mjs", "--help"]),
     ).resolves.toEqual(new Set());
+    await expect(
+      resolvedPackages(evaluate('await import("./dist/cli.js");')),
+    ).resolves.toEqual(new Set());
+  });
+
+  it("renders guidance without loading the tool catalog or provider composition", async () => {
+    await expect(
+      resolvedPackages([
+        "scripts/rea.mjs",
+        "guided-workflows",
+        "--action",
+        "render",
+        "--workflow-id",
+        "investigate_feature",
+        "--arguments-json",
+        JSON.stringify({ feature: "offline search" }),
+        "--json",
+      ]),
+    ).resolves.toEqual(new Set(["guided-workflows"]));
   });
 
   it("does not load native provider composition for JavaScript application analysis", async () => {
@@ -293,12 +348,16 @@ describe("CLI startup imports", () => {
 });
 
 describe("MCP startup imports", () => {
-  it("does not load command-specific dependencies to initialize and list tools", async () => {
+  it("initializes and lists tools over stdio with HTTP-only environment settings present", async () => {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [`--import=${RESOLUTION_HOOK}`, "scripts/rea.mjs", "mcp"],
       cwd: process.cwd(),
-      env: { PATH: process.env.PATH ?? "" },
+      env: {
+        PATH: process.env.PATH ?? "",
+        MCP_HOST: " ",
+        MCP_PORT: "not-a-port",
+      },
       stderr: "pipe",
     });
     let stderr = "";
@@ -316,6 +375,7 @@ describe("MCP startup imports", () => {
       await client.close();
     }
     const resolved = resolvedMarkers(stderr);
+    expect(stderr).not.toContain("MCP transport listening");
     expect(resolved).not.toContain("playwright-core");
     expect(resolved).not.toContain("isomorphic-git");
   });

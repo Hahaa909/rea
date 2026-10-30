@@ -37,16 +37,30 @@ afterEach(() => {
 const ready = async () => {
   const { cacheRoot, open } = await session("rea-kuna-reader-cancel-");
   const client = open();
-  await expect
-    .poll(
-      async () =>
-        (await run(client, "procedure_pseudo_code", { procedure: "main" }))
-          .rawResult,
-    )
-    .toMatchObject({ source: { kind: "project-export" } });
-  const [key] = await readdir(join(cacheRoot, "projects"));
-  held.path = join(cacheRoot, "projects", key ?? "", "project", "program.asm");
-  return { client, bytes: await readFile(held.path) };
+  try {
+    // Export warm-up is independent of the cancellation deadline below and
+    // may take longer when the complete test process family has a CPU quota.
+    await expect
+      .poll(
+        async () =>
+          (await run(client, "procedure_pseudo_code", { procedure: "main" }))
+            .rawResult,
+        { timeout: 5000 },
+      )
+      .toMatchObject({ source: { kind: "project-export" } });
+    const [key] = await readdir(join(cacheRoot, "projects"));
+    held.path = join(
+      cacheRoot,
+      "projects",
+      key ?? "",
+      "project",
+      "program.asm",
+    );
+    return { client, bytes: await readFile(held.path) };
+  } catch (cause: unknown) {
+    await client.close();
+    throw cause;
+  }
 };
 
 const it = test.skipIf(process.platform === "win32");
@@ -70,12 +84,17 @@ it.each([
     const other = run(client, "procedure_assembly", { procedure: "parse" });
     try {
       await expect.poll(() => held.streams.length).toBe(1);
-      controller.abort();
+      const reason = Object.freeze({ requested: "reader-stop", operation });
+      controller.abort(reason);
       await expect.poll(() => finished, { timeout: 1000 }).toBe(true);
-      expect(await cancelled).toMatchObject({
+      const cancelledResult = await cancelled;
+      expect(cancelledResult).toMatchObject({
         ok: false,
         error: { _tag: "AnalysisCancelledError" },
       });
+      expect(cancelledResult.ok ? undefined : cancelledResult.error.cause).toBe(
+        reason,
+      );
       expect(held.streams[0]?.destroyed).toBe(false);
       expect((await run(client, "health")).result).toBeDefined();
       held.streams[0]?.end(bytes);
